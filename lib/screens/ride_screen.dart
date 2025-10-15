@@ -20,8 +20,9 @@ class _RideScreenState extends State<RideScreen> {
   StreamSubscription<Position>? _positionSub;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
-  bool _movementDetected = false;
-  double _motionLevel = 0.0; // how much device shakes/moves
+  bool _trackingActive = false; // True = GPS actively reading
+  double _motionLevel = 0.0;
+  Timer? _noMoveTimer;
 
   @override
   void initState() {
@@ -30,27 +31,22 @@ class _RideScreenState extends State<RideScreen> {
     _initGPS();
   }
 
+  // Initialize accelerometer to trigger GPS updates
   void _initSensors() {
     _accelSub = accelerometerEvents.listen((AccelerometerEvent event) {
       final magnitude = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
       final deviation = (magnitude - 9.8).abs();
-
-      // Low-pass filter to smooth accelerometer noise
       _motionLevel = 0.8 * _motionLevel + 0.2 * deviation;
 
-      // If significant movement, consider user moving
-      if (_motionLevel > 0.25) {
-        _movementDetected = true;
-      } else {
-        // Immediately mark stopped when below motion threshold
-        if (_movementDetected) {
-          _movementDetected = false;
-          setState(() => _speed = 0.0); // Immediately drop to zero
-        }
+      // When spike happens, enable GPS tracking
+      if (_motionLevel > 0.3 && !_trackingActive) {
+        debugPrint("🚴 Movement detected — GPS tracking started");
+        setState(() => _trackingActive = true);
       }
     });
   }
 
+  // Initialize GPS stream
   void _initGPS() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) return;
@@ -68,14 +64,23 @@ class _RideScreenState extends State<RideScreen> {
         distanceFilter: 1,
       ),
     ).listen((Position position) {
-      if (!_movementDetected) {
-        setState(() => _speed = 0.0);
-        return;
-      }
+      if (!_trackingActive) return;
 
+      final newSpeed = position.speed * 3.6; // convert to km/h
+
+      // If location hasn't changed for 5s → stop tracking
+      _noMoveTimer?.cancel();
+      _noMoveTimer = Timer(const Duration(seconds: 5), () {
+        if (_trackingActive) {
+          debugPrint("🛑 No movement for 5s — speed reset");
+          setState(() => _speed = 0.0);
+          setState(() => _trackingActive = false);
+        }
+      });
+
+      // Only update if tracking active
       setState(() {
-        final speed = position.speed * 3.6; // m/s → km/h
-        _speed = speed < 0.5 ? 0.0 : speed;
+        _speed = newSpeed < 0.5 ? 0.0 : newSpeed;
         _elevation = position.altitude;
 
         if (_lastPosition != null) {
@@ -91,6 +96,7 @@ class _RideScreenState extends State<RideScreen> {
     });
   }
 
+  // Distance calculation using haversine formula
   double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
     const p = 0.017453292519943295; // pi / 180
     final a = 0.5 -
@@ -104,11 +110,13 @@ class _RideScreenState extends State<RideScreen> {
   void dispose() {
     _positionSub?.cancel();
     _accelSub?.cancel();
+    _noMoveTimer?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return Scaffold(
       body: SafeArea(
         child: Container(
@@ -117,7 +125,7 @@ class _RideScreenState extends State<RideScreen> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Smooth animated speed
+              // Animated Speed
               TweenAnimationBuilder<double>(
                 tween: Tween<double>(begin: 0, end: _speed),
                 duration: const Duration(milliseconds: 400),
@@ -128,7 +136,9 @@ class _RideScreenState extends State<RideScreen> {
                     style: TextStyle(
                       fontSize: 100,
                       fontWeight: FontWeight.bold,
-                      color: Theme.of(context).colorScheme.primary,
+                      color: value > 0
+                          ? theme.colorScheme.primary
+                          : Colors.grey.shade500,
                     ),
                   );
                 },
@@ -136,7 +146,7 @@ class _RideScreenState extends State<RideScreen> {
               const Text("km/h", style: TextStyle(fontSize: 24)),
               const SizedBox(height: 40),
 
-              // Info cards
+              // Info Cards
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
@@ -153,10 +163,22 @@ class _RideScreenState extends State<RideScreen> {
                     _elevation = 0;
                     _distance = 0;
                     _lastPosition = null;
+                    _trackingActive = false;
                   });
                 },
                 icon: const Icon(Icons.refresh),
                 label: const Text("Reset Trip"),
+              ),
+              const SizedBox(height: 20),
+
+              Text(
+                _trackingActive ? "Tracking active" : "Waiting for motion...",
+                style: TextStyle(
+                  fontSize: 16,
+                  color: _trackingActive
+                      ? Colors.green.shade600
+                      : Colors.grey.shade600,
+                ),
               ),
             ],
           ),
