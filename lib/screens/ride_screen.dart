@@ -1,8 +1,10 @@
+import 'dart:async';
+import 'dart:math' show sqrt, cos, asin;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'dart:async';
-import 'dart:math' show sqrt, cos, asin;
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
 
 class RideScreen extends StatefulWidget {
   const RideScreen({super.key});
@@ -12,17 +14,19 @@ class RideScreen extends StatefulWidget {
 }
 
 class _RideScreenState extends State<RideScreen> {
-  double _speed = 0.0;       // km/h
-  double _elevation = 0.0;   // meters
-  double _distance = 0.0;    // kilometers
+  double _speed = 0.0; // km/h
+  double _elevation = 0.0;
+  double _distance = 0.0;
   Position? _lastPosition;
+  DateTime? _lastMoveTime;
 
   StreamSubscription<Position>? _positionSub;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
-  bool _trackingActive = false; // True = GPS actively reading
+  bool _movementDetected = false;
   double _motionLevel = 0.0;
-  Timer? _noMoveTimer;
+  List<LatLng> _path = [];
+  final MapController _mapController = MapController();
 
   @override
   void initState() {
@@ -31,25 +35,32 @@ class _RideScreenState extends State<RideScreen> {
     _initGPS();
   }
 
-  // Initialize accelerometer to trigger GPS updates
+  // --- Accelerometer logic ---
   void _initSensors() {
     _accelSub = accelerometerEvents.listen((AccelerometerEvent event) {
-      final magnitude = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+      final magnitude =
+          sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
       final deviation = (magnitude - 9.8).abs();
+
       _motionLevel = 0.8 * _motionLevel + 0.2 * deviation;
 
-      // When spike happens, enable GPS tracking
-      if (_motionLevel > 0.3 && !_trackingActive) {
-        debugPrint("🚴 Movement detected — GPS tracking started");
-        setState(() => _trackingActive = true);
+      if (_motionLevel > 0.25) {
+        if (!_movementDetected) {
+          debugPrint("📱 Motion spike detected — start reading GPS");
+        }
+        _movementDetected = true;
+        _lastMoveTime = DateTime.now();
       }
     });
   }
 
-  // Initialize GPS stream
+  // --- GPS logic ---
   void _initGPS() async {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) return;
+    if (!serviceEnabled) {
+      debugPrint("⚠️ Location service not enabled");
+      return;
+    }
 
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
@@ -64,23 +75,49 @@ class _RideScreenState extends State<RideScreen> {
         distanceFilter: 1,
       ),
     ).listen((Position position) {
-      if (!_trackingActive) return;
+      final now = DateTime.now();
 
-      final newSpeed = position.speed * 3.6; // convert to km/h
+      // --- check no GPS position change for 5s ---
+      if (_lastPosition != null) {
+        final dist = _calculateDistance(
+          _lastPosition!.latitude,
+          _lastPosition!.longitude,
+          position.latitude,
+          position.longitude,
+        );
 
-      // If location hasn't changed for 5s → stop tracking
-      _noMoveTimer?.cancel();
-      _noMoveTimer = Timer(const Duration(seconds: 5), () {
-        if (_trackingActive) {
-          debugPrint("🛑 No movement for 5s — speed reset");
+        if (dist < 0.002 && now.difference(_lastMoveTime ?? now).inSeconds > 5) {
+          if (_movementDetected) debugPrint("🕒 No GPS movement for 5s → stop");
+          _movementDetected = false;
           setState(() => _speed = 0.0);
-          setState(() => _trackingActive = false);
+          return;
+        } else if (dist >= 0.002) {
+          _lastMoveTime = now;
         }
-      });
+      }
 
-      // Only update if tracking active
+      if (!_movementDetected) return;
+
+      // --- calculate filtered GPS speed ---
+      final rawSpeed = position.speed * 3.6; // m/s → km/h
+      double jitterDistance = 0.0;
+      if (_lastPosition != null) {
+        jitterDistance = _calculateDistance(
+          _lastPosition!.latitude,
+          _lastPosition!.longitude,
+          position.latitude,
+          position.longitude,
+        ) * 1000; // meters
+      }
+
+      // Ignore GPS noise (movement <2m and low speed)
+      if (jitterDistance < 2 && rawSpeed < 1.0) {
+        debugPrint("🚫 GPS noise filtered out");
+        return;
+      }
+
       setState(() {
-        _speed = newSpeed < 0.5 ? 0.0 : newSpeed;
+        _speed = rawSpeed < 0.8 ? 0.0 : rawSpeed;
         _elevation = position.altitude;
 
         if (_lastPosition != null) {
@@ -91,122 +128,153 @@ class _RideScreenState extends State<RideScreen> {
             position.longitude,
           );
         }
+
         _lastPosition = position;
+
+        final latLng = LatLng(position.latitude, position.longitude);
+        _path.add(latLng);
+        if (_path.length > 1) {
+          _mapController.move(latLng, _mapController.camera.zoom);
+        }
       });
+
+      debugPrint("📍 Speed: ${_speed.toStringAsFixed(2)} km/h | "
+          "Elevation: ${_elevation.toStringAsFixed(1)} m | "
+          "Distance: ${_distance.toStringAsFixed(3)} km");
     });
   }
 
-  // Distance calculation using haversine formula
   double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
-    const p = 0.017453292519943295; // pi / 180
+    const p = 0.017453292519943295;
     final a = 0.5 -
         cos((lat2 - lat1) * p) / 2 +
-        cos(lat1 * p) * cos(lat2 * p) *
-            (1 - cos((lon2 - lon1) * p)) / 2;
-    return 12742 * asin(sqrt(a)); // 2 * R * asin...
+        cos(lat1 * p) * cos(lat2 * p) * (1 - cos((lon2 - lon1) * p)) / 2;
+    return 12742 * asin(sqrt(a)); // kilometers
   }
 
   @override
   void dispose() {
     _positionSub?.cancel();
     _accelSub?.cancel();
-    _noMoveTimer?.cancel();
     super.dispose();
   }
 
+  void _resetTrip() {
+    setState(() {
+      _speed = 0;
+      _elevation = 0;
+      _distance = 0;
+      _lastPosition = null;
+      _path.clear();
+    });
+    debugPrint("🔁 Trip reset");
+  }
+
+  // --- UI ---
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     return Scaffold(
       body: SafeArea(
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              // Animated Speed
-              TweenAnimationBuilder<double>(
-                tween: Tween<double>(begin: 0, end: _speed),
-                duration: const Duration(milliseconds: 400),
-                curve: Curves.easeOut,
-                builder: (context, value, child) {
-                  return Text(
-                    value.toStringAsFixed(1),
-                    style: TextStyle(
-                      fontSize: 100,
-                      fontWeight: FontWeight.bold,
-                      color: value > 0
-                          ? theme.colorScheme.primary
-                          : Colors.grey.shade500,
-                    ),
-                  );
-                },
-              ),
-              const Text("km/h", style: TextStyle(fontSize: 24)),
-              const SizedBox(height: 40),
-
-              // Info Cards
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        child: Column(
+          children: [
+            // --- Stats section ---
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16),
+              child: Column(
                 children: [
-                  _animatedInfoCard("Elevation", _elevation, "m", Icons.terrain),
-                  _animatedInfoCard("Distance", _distance, "km", Icons.route),
+                  TweenAnimationBuilder<double>(
+                    tween: Tween<double>(begin: 0, end: _speed),
+                    duration: const Duration(milliseconds: 400),
+                    curve: Curves.easeOut,
+                    builder: (context, value, _) {
+                      return Text(
+                        value.toStringAsFixed(1),
+                        style: TextStyle(
+                          fontSize: 80,
+                          fontWeight: FontWeight.bold,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      );
+                    },
+                  ),
+                  const Text("km/h", style: TextStyle(fontSize: 22)),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      _infoCard("Elevation", _elevation, "m", Icons.terrain),
+                      _infoCard("Distance", _distance, "km", Icons.route),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  ElevatedButton.icon(
+                    onPressed: _resetTrip,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text("Reset Trip"),
+                  ),
                 ],
               ),
-              const SizedBox(height: 40),
-
-              ElevatedButton.icon(
-                onPressed: () {
-                  setState(() {
-                    _speed = 0;
-                    _elevation = 0;
-                    _distance = 0;
-                    _lastPosition = null;
-                    _trackingActive = false;
-                  });
-                },
-                icon: const Icon(Icons.refresh),
-                label: const Text("Reset Trip"),
-              ),
-              const SizedBox(height: 20),
-
-              Text(
-                _trackingActive ? "Tracking active" : "Waiting for motion...",
-                style: TextStyle(
-                  fontSize: 16,
-                  color: _trackingActive
-                      ? Colors.green.shade600
-                      : Colors.grey.shade600,
-                ),
-              ),
-            ],
-          ),
+            ),
+            const Divider(height: 1),
+            // --- Map section ---
+            Expanded(
+              child: _path.isEmpty
+                  ? const Center(child: Text("Waiting for GPS..."))
+                  : FlutterMap(
+                      mapController: _mapController,
+                      options: MapOptions(
+                        initialCenter: _path.last,
+                        initialZoom: 17,
+                        keepAlive: true,
+                      ),
+                      children: [
+                        TileLayer(
+                          urlTemplate:
+                              'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          subdomains: const ['a', 'b', 'c'],
+                        ),
+                        PolylineLayer(
+                          polylines: [
+                            Polyline(
+                              points: _path,
+                              color: Colors.red,
+                              strokeWidth: 4,
+                            ),
+                          ],
+                        ),
+                        MarkerLayer(
+                          markers: [
+                            Marker(
+                              point: _path.last,
+                              width: 40,
+                              height: 40,
+                              child: const Icon(
+                                Icons.my_location,
+                                color: Colors.blue,
+                                size: 36,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+            ),
+          ],
         ),
       ),
     );
   }
 
-  Widget _animatedInfoCard(String title, double value, String unit, IconData icon) {
+  Widget _infoCard(String title, double value, String unit, IconData icon) {
     return Card(
-      elevation: 4,
+      elevation: 3,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: Column(
           children: [
-            Icon(icon, size: 28, color: Theme.of(context).colorScheme.primary),
-            const SizedBox(height: 6),
-            Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 4),
-            TweenAnimationBuilder<double>(
-              tween: Tween<double>(begin: 0, end: value),
-              duration: const Duration(milliseconds: 500),
-              curve: Curves.easeOut,
-              builder: (context, val, child) => Text(
-                "${val.toStringAsFixed(value < 10 ? 2 : 1)} $unit",
-                style: const TextStyle(fontSize: 20),
-              ),
-            ),
+            Icon(icon, color: Theme.of(context).colorScheme.primary),
+            Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+            Text("${value.toStringAsFixed(1)} $unit"),
           ],
         ),
       ),
